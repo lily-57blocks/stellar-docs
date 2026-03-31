@@ -1,0 +1,175 @@
+---
+title: Blocksmith
+description: A Rust-first testing toolkit for Stellar / Soroban smart contracts.
+sidebar_label: Blocksmith
+sidebar_position: 50
+---
+
+# Blocksmith
+
+> **Write one test suite. Switch backend with one line.**
+
+A Rust-first testing toolkit for Stellar / Soroban smart contracts.
+
+[Blocksmith](https://github.com/57blocks/blocksmith-stellar) lets you run **the same test flow** against either:
+
+- **Soroban VM (`EnvClient`)** — fast feedback.
+- **Local network (`RpcClient`)** — parity with real node behavior (simulation, auth, footprint, …).
+
+---
+
+## Why Blocksmith?
+
+**Resource usage on RPC.** Unlike plain Soroban RPC clients, Blocksmith wraps the server and intercepts transaction metadata. After each simulated or submitted transaction, you get a formatted table showing per-contract, per-function metrics (CPU, memory, ledger reads/writes). This makes it easy to spot hot paths and optimize your contracts.
+
+Stellar / Soroban teams often maintain two separate test styles:
+
+|         | VM tests   | RPC tests                  |
+| ------- | ---------- | -------------------------- |
+| Speed   | Fast       | Slow (network round-trips) |
+| Realism | Simplified | Full node behavior         |
+
+Blocksmith **merges both** into a single async API:
+
+- `Ctx<I>` — unified execution context (`I = EnvClient` or `RpcClient`).
+- `contract_client!("path/to/token.wasm")` — generates a typed Rust client at compile time.
+- Cheatcodes — `mock_auth`, `start_mock_auth`, `with_mock_auth`, `generate_address`, …
+
+---
+
+## ⚠️ Important: Blocksmith is a test-only tool — do NOT use in contract `src/`
+
+Blocksmith depends on `std` (networking, file I/O, threads, `tokio`). Soroban contract crates compile under **`#![no_std]`** for `wasm32-unknown-unknown`.
+
+If you import Blocksmith in your contract's `src/` directory, you will get compile errors like:
+
+```
+error[E0463]: can't find crate for `std`
+```
+
+**Correct usage:** add Blocksmith only as a dependency in a **separate test crate** (or in your workspace's `tests/` package):
+
+```
+my-project/
+├── contracts/
+│   └── token/
+│       ├── Cargo.toml          # soroban-sdk only, no_std
+│       └── src/lib.rs          # contract code — NO blocksmith here!
+├── tests/
+│   ├── Cargo.toml              # blocksmith + tokio as dependencies
+│   └── tests/
+│       └── token_test.rs       # test code — blocksmith goes here ✅
+```
+
+---
+
+## Version policy
+
+Blocksmith is **tightly coupled** to Soroban major versions.
+
+| Blocksmith | Soroban SDK | stellar-core |
+| ---------- | ----------- | ------------ |
+| 0.1.0      | 25.1.0      | v25          |
+
+For each future Stellar / Soroban major release, Blocksmith will publish a matching major line. Your contract crate and Blocksmith **must** use the same Soroban SDK major line (otherwise you hit `Env` / `Val` / `XDR` type conflicts).
+
+---
+
+## Crate structure
+
+| Crate | Description |
+| --- | --- |
+| `blocksmith` | Main crate — contains all modules, add this to your test crate |
+| `blocksmith-macros` | `contract_client!` proc-macro |
+
+---
+
+## Quick start
+
+This quickstart guide demonstrates a simple hello world test. You can run the same process on `EnvClient` (Fast Virtual Machine) and `RpcClient` (Native RPC) by passing a selected caller to the process. Prerequisites
+
+- Rust toolchain matching `rust-toolchain.toml` (currently 1.88.0)
+- A compiled WASM for your contract (e.g. via `soroban contract build`)
+- For RPC tests: a local Soroban RPC endpoint (e.g. `http://localhost:8000/rpc`)
+
+Add dependencies (test crate's `Cargo.toml`)
+
+```toml
+[dependencies]
+blocksmith = "0.1.0"
+soroban-sdk = "25.1.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+Example file: `tests/tests/hello_world_env_rpc.rs`
+
+```rust,ignore
+use blocksmith::soroban_codec::Address;
+use blocksmith::{Ctx, EnvClient, InvokerClient, RpcClient};
+
+// ---------- typed contract client from WASM spec ----------
+mod hello_mod {
+    blocksmith::contract_client!("fixtures/soroban_hello_world_contract.wasm");
+}
+
+/// Helper: read the hello-world contract WASM.
+fn hello_wasm() -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("fixtures/soroban_hello_world_contract.wasm");
+    std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {path:?}: {e}"))
+}
+
+/// Helper: create EnvClient + Ctx (in-memory, no server needed).
+fn setup_env() -> Ctx<EnvClient> {
+    let invoker = EnvClient::new_mock();
+    Ctx::new(invoker)
+}
+
+/// Helper: create RpcClient + Ctx with common config.
+async fn setup_rpc() -> Ctx<RpcClient> {
+    let invoker = RpcClient::new(blocksmith_tests::RPC_URL).await.unwrap();
+    Ctx::new(invoker)
+}
+
+/// Shared test flow: deploy hello-world contract and call `hello()` with multiple inputs.
+async fn flow<I>(ctx: Ctx<I>)
+where
+    I: InvokerClient + 'static,
+{
+    let wasm = hello_wasm();
+
+    let deployer: Address = ctx.generate_address().await;
+    ctx.start_mock_auth(&deployer).await;
+
+    let contract_id: Address = ctx.deploy_wasm(&wasm).await;
+
+    let inv = ctx.invoker_handle();
+    let mut client = hello_mod::Contract::new(inv.clone(), contract_id.to_string());
+
+    let result: Vec<String> = client.hello(&"Stellar".to_string()).await;
+    println!("hello(Stellar) => {result:?}");
+    assert_eq!(result, vec!["Hello", "Stellar"]);
+
+    let result: Vec<String> = client.hello(&"Blocksmith".to_string()).await;
+    println!("hello(Blocksmith) => {result:?}");
+    ctx.print_resource_table().await;
+    assert_eq!(result, vec!["Hello", "Blocksmith"]);
+}
+
+/// deploy + call hello() via in-memory EnvClient (no server needed).
+#[tokio::test]
+async fn env_hello_deploy_and_test() {
+    let ctx = setup_env();
+    flow(ctx).await;
+    println!("✓ env_hello_deploy_and_test passed");
+}
+
+/// deploy + call hello() via live RPC backend.
+#[tokio::test]
+#[ignore = "requires local RPC server (see blocksmith_tests::RPC_URL)"]
+async fn rpc_hello_deploy_and_test() {
+    let ctx = setup_rpc().await;
+    flow(ctx).await;
+    println!("✓ rpc_hello_deploy_and_test passed");
+}
+```
